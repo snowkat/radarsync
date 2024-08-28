@@ -36,9 +36,9 @@ struct Args {
     /// Disable the QR Code display
     #[arg(long)]
     no_qr: bool,
-    /// The directory to sync
+    /// Paths to transfer to the device
     #[arg(required = true)]
-    path: Vec<PathBuf>,
+    paths: Vec<PathBuf>,
 }
 
 // Wrapper for app_main
@@ -154,7 +154,7 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    for path in args.path {
+    for path in args.paths {
         if path.is_dir() {
             if args.recurse {
                 let dir = path.clone();
