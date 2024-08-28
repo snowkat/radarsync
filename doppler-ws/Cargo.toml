@@ -1,0 +1,34 @@
+[package]
+name = "doppler-ws"
+description = "Bindings for Doppler Transfer web API"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["net"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "stream",
+    "rustls-tls",
+    "charset",
+    "macos-system-configuration",
+] }
+tokio-websockets = { version = "0.9", features = [
+    "rustls-webpki-roots",
+    "aws_lc_rs",
+    "client",
+    "fastrand",
+] }
+serde = { version = "1.0.198", features = ["derive"] }
+serde_json = "1.0.116"
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+# http::Url required for tokio-websockets, url::Url required for reqwest
+http = "1.1"
+url = "2.4"
+
+hyper-rustls = "0.27"
+thiserror = "1"
+futures-util = { version = "0.3.30", features = ["sink"] }
+
+mime = "0.3"

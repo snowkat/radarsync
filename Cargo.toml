@@ -1,0 +1,3 @@
+[workspace]
+members = ["doppler-ws", "radarsync"]
+resolver = "2"
