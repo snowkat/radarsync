@@ -11,7 +11,7 @@ radarsync is intended to transfer files to [Doppler for iOS] where the [macOS ap
 Assuming you have cargo installed, the package can be built from source:
 
 ```
-git clone https://github.com/flurrikat/radarsync
+git clone https://github.com/snowkat/radarsync
 cd radarsync
 cargo install --path radarsync --locked
 ```
