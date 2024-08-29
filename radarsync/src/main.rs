@@ -154,12 +154,14 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    // Get all paths we care about
+    let mut selected = Vec::new();
     for path in args.paths {
         if path.is_dir() {
             if args.recurse {
                 let dir = path.clone();
                 // Recursively get all paths, then find the ones with MIME types we care about
-                let paths = tokio::task::spawn_blocking(move || get_dir_paths(&dir))
+                let mut paths = tokio::task::spawn_blocking(move || get_dir_paths(&dir))
                     .await
                     .with_context(|| format!("while recursing {}", path.display()))??
                     .into_iter()
@@ -168,13 +170,9 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
                             .iter()
                             .find(|m| device.mime_supported(m))
                             .map(|mime| (p, mime))
-                    });
-                // Then, take the remaining files and process them
-                for (path, mime) in paths {
-                    process_file(&device, mime, &path)
-                        .await
-                        .with_context(|| format!("{}", path.display()))?;
-                }
+                    })
+                    .collect();
+                selected.append(&mut paths);
             } else {
                 tracing::warn!(
                     "skipping directory '{}' as -r was not defined",
@@ -189,10 +187,20 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
                 bail!("{}: unsupported mime type", path.display());
             };
 
-            process_file(&device, mime, &path)
-                .await
-                .with_context(|| format!("{}", path.display()))?;
+            selected.push((path, mime));
         }
+    }
+
+    if selected.is_empty() {
+        bail!("No music files were found");
+    }
+
+    tracing::info!("Uploading {} files", selected.len());
+
+    for (path, mime) in selected {
+        process_file(&device, mime, &path)
+            .await
+            .with_context(|| format!("{}", path.display()))?;
     }
 
     Ok(())
