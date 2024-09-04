@@ -3,6 +3,7 @@ mod db;
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
 };
 
 use anyhow::{bail, Context};
@@ -10,6 +11,7 @@ use clap::Parser;
 use db::Library;
 use doppler_ws::device::DeviceClient;
 use mime_guess::Mime;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::level_filters::LevelFilter;
 
 /// Utility to transfer music to Doppler for iOS
@@ -30,6 +32,9 @@ struct Args {
     /// Sync all music files recursively
     #[arg(short, long)]
     recurse: bool,
+    /// Number of upload tasks to run simultaneously
+    #[arg(short, long, default_value_t = 5)]
+    tasks: u8,
     /// Sync to a saved device
     #[arg(short, long)]
     device: Option<String>,
@@ -78,6 +83,7 @@ async fn process_file<'a, P: AsRef<Path>>(
     device: &DeviceClient,
     mime: Mime,
     path: &'a P,
+    _permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<()> {
     tracing::info!("Uploading {}", path.as_ref().display());
     let file = tokio::fs::File::open(path).await?;
@@ -86,6 +92,35 @@ async fn process_file<'a, P: AsRef<Path>>(
     device.upload(path, meta.len(), mime, file).await?;
 
     Ok(())
+}
+
+async fn process_all_paths(
+    device: Arc<DeviceClient>,
+    selected: Vec<(PathBuf, Mime)>,
+    sender: mpsc::Sender<anyhow::Error>,
+    max_tasks: usize,
+) {
+    let semaphore = Arc::new(Semaphore::new(max_tasks));
+
+    let mut tasks = Vec::new();
+    for (path, mime) in selected {
+        let sender = sender.clone();
+        let device = device.clone();
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let task = tokio::spawn(async move {
+            if let Err(err) = process_file(&device, mime, &path, permit)
+                .await
+                .with_context(|| format!("{}", path.display()))
+            {
+                //
+                let str_err = err.to_string();
+                if sender.send(err).await.is_err() {
+                    tracing::error!("I have no receiver and I must scream: {str_err}");
+                }
+            }
+        });
+        tasks.push(task);
+    }
 }
 
 /// Recursively get all file paths in a directory.
@@ -197,11 +232,18 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
 
     tracing::info!("Uploading {} files", selected.len());
 
-    for (path, mime) in selected {
-        process_file(&device, mime, &path)
-            .await
-            .with_context(|| format!("{}", path.display()))?;
-    }
+    let device = Arc::new(device);
+    let (send, mut recv) = mpsc::channel::<anyhow::Error>(1);
 
-    Ok(())
+    tokio::spawn(process_all_paths(
+        device.clone(),
+        selected,
+        send,
+        args.tasks as usize,
+    ));
+    if let Some(err) = recv.recv().await {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
