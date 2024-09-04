@@ -1,18 +1,46 @@
 mod db;
+mod progress;
 
 use std::{
+    fmt,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{bail, Context};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use db::Library;
 use doppler_ws::device::DeviceClient;
 use mime_guess::Mime;
+use progress::Progression;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::level_filters::LevelFilter;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum ProgressMode {
+    /// Always show a progress bar.
+    On,
+    /// Never show a progress bar.
+    Off,
+    /// Show a progress bar if the output is shown on the terminal, and -q is
+    /// not defined.
+    #[default]
+    Auto,
+}
+
+impl fmt::Display for ProgressMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+        .fmt(f)
+    }
+}
 
 /// Utility to transfer music to Doppler for iOS
 #[derive(Parser, Debug)]
@@ -32,12 +60,21 @@ struct Args {
     /// Sync all music files recursively
     #[arg(short, long)]
     recurse: bool,
+    /// How to display upload progress
+    #[arg(long, default_value_t)]
+    progress: ProgressMode,
     /// Number of upload tasks to run simultaneously
     #[arg(short, long, default_value_t = 5)]
     tasks: u8,
     /// Sync to a saved device
     #[arg(short, long)]
     device: Option<String>,
+    /// List all saved devices
+    #[arg(long, conflicts_with = "paths")]
+    list_devices: bool,
+    /// Forget the named device
+    #[arg(long, conflicts_with = "paths")]
+    drop_device: Option<String>,
     /// Disable the QR Code display
     #[arg(long)]
     no_qr: bool,
@@ -46,10 +83,20 @@ struct Args {
     paths: Vec<PathBuf>,
 }
 
-// Wrapper for app_main
-fn main() -> ExitCode {
-    let args = Args::parse();
+fn init_args() -> Args {
+    let mut args = Args::parse();
 
+    // The progress bar should be shown with 'auto' if:
+    // - stdout is a tty
+    // - quiet is not set
+
+    if std::io::stderr().is_terminal() && !args.quiet {
+        args.progress = ProgressMode::On;
+    } else {
+        args.progress = ProgressMode::Off;
+    }
+
+    // Set the log level according to the arguments
     let log_level = if args.quiet {
         // No messages
         LevelFilter::OFF
@@ -67,6 +114,13 @@ fn main() -> ExitCode {
         .with_level(false)
         .with_max_level(log_level)
         .init();
+
+    args
+}
+
+// Wrapper for app_main
+fn main() -> ExitCode {
+    let args = init_args();
 
     if let Err(err) = tokio::runtime::Runtime::new()
         .unwrap()
@@ -99,11 +153,13 @@ async fn process_all_paths(
     selected: Vec<(PathBuf, Mime)>,
     sender: mpsc::Sender<anyhow::Error>,
     max_tasks: usize,
+    progress: Progression,
 ) {
     let semaphore = Arc::new(Semaphore::new(max_tasks));
 
     let mut tasks = Vec::new();
     for (path, mime) in selected {
+        let progress = progress.clone();
         let sender = sender.clone();
         let device = device.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -118,6 +174,7 @@ async fn process_all_paths(
                     tracing::error!("I have no receiver and I must scream: {str_err}");
                 }
             }
+            progress.inc(1);
         });
         tasks.push(task);
     }
@@ -148,12 +205,36 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
         .context("Error accessing Doppler API")?;
     let library = Library::open().await?;
 
+    // First, process the short-circuit stuff
+    if args.list_devices {
+        let names = library.device_names().await?;
+        println!("Saved devices:");
+        for name in names {
+            println!("  {name}");
+        }
+        std::process::exit(0);
+    } else if let Some(name) = args.drop_device {
+        library.delete_device(&name).await?;
+        println!("Device {name} forgotten.");
+        std::process::exit(0);
+    }
+
     let mut response = if let Some(device) = args.device {
         // Perform the saved device pairing flow
         let Some(device) = library.get_device(&device).await? else {
             bail!("Device name not found");
         };
-        api.get_saved_device(&device).await
+        let spin = Progression::new_spinner(
+            args.progress,
+            format!(
+                "Waiting for {} to respond...",
+                device.name.as_deref().unwrap_or("device")
+            ),
+        );
+        spin.enable_steady_tick(Duration::from_millis(300));
+        let result = api.get_saved_device(&device).await;
+        spin.finish_and_clear();
+        result
     } else {
         // Pair by code
         let pairing_code = api.code();
@@ -193,6 +274,11 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
     let mut selected = Vec::new();
     for path in args.paths {
         if path.is_dir() {
+            let spin = Progression::new_spinner(
+                args.progress,
+                format!("Finding music files for {}", path.display()),
+            );
+            spin.enable_steady_tick(Duration::from_millis(300));
             if args.recurse {
                 let dir = path.clone();
                 // Recursively get all paths, then find the ones with MIME types we care about
@@ -214,6 +300,7 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
                     path.display()
                 );
             }
+            spin.finish_and_clear();
         } else {
             let Some(mime) = mime_guess::from_path(&path)
                 .iter()
@@ -230,20 +317,30 @@ async fn app_main(args: Args) -> anyhow::Result<()> {
         bail!("No music files were found");
     }
 
+    let file_count = selected.len();
     tracing::info!("Uploading {} files", selected.len());
 
     let device = Arc::new(device);
     let (send, mut recv) = mpsc::channel::<anyhow::Error>(1);
+
+    let progress = Progression::new(
+        args.progress,
+        file_count as u64,
+        format!("Uploading {file_count} files"),
+    );
 
     tokio::spawn(process_all_paths(
         device.clone(),
         selected,
         send,
         args.tasks as usize,
+        progress.clone(),
     ));
     if let Some(err) = recv.recv().await {
+        progress.abandon();
         Err(err)
     } else {
+        progress.finish_and_clear();
         Ok(())
     }
 }

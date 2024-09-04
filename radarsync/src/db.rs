@@ -36,6 +36,23 @@ impl Library {
         Ok(Self { db })
     }
 
+    /// Gets a list of saved device names.
+    pub async fn device_names(&self) -> anyhow::Result<Vec<String>> {
+        use sqlx::Row;
+        let mut conn = self.db.acquire().await?;
+        match sqlx::query("SELECT name FROM devices")
+            .fetch_all(conn.as_mut())
+            .await
+        {
+            Ok(res) => Ok(res
+                .into_iter()
+                .filter_map(|m| m.try_get("name").ok())
+                .collect()),
+            Err(sqlx::Error::RowNotFound) => Ok(Vec::new()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Gets a saved device with the provided name.
     pub async fn get_device(&self, name: impl AsRef<str>) -> anyhow::Result<Option<Device>> {
         let name = name.as_ref();
@@ -94,6 +111,15 @@ impl Library {
         )
         .execute(conn.as_mut())
         .await?;
+        Ok(())
+    }
+
+    pub async fn delete_device(&self, name: impl Into<String>) -> anyhow::Result<()> {
+        let name = name.into();
+        let mut conn = self.db.acquire().await?;
+        sqlx::query!("DELETE FROM devices WHERE name = ?", name)
+            .execute(conn.as_mut())
+            .await?;
         Ok(())
     }
 }
